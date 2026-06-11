@@ -9,6 +9,11 @@ type ts = { mutable start_time : float; mutable end_time : float }
    This can be user configurable with OCAMLRUNPARAM=d=XXX
 *)
 let number_domains = 128
+
+(* Largest GC pause (in nanoseconds) the latency histogram can track. Pauses
+   beyond this are summarised separately. *)
+let highest_trackable_value = 10_000_000_000
+
 let wall_time = { start_time = 0.; end_time = 0. }
 let rss_collector = Olly_common.Max_rss.create ()
 let domain_elapsed_times = Array.make number_domains 0.
@@ -19,6 +24,21 @@ let minor_collections = ref 0
 let major_collections = ref 0
 let forced_major_collections = ref 0
 let compactions = ref 0
+
+(* Running summary of GC pauses that fall outside the histogram's range. *)
+type outliers = { mutable count : int; mutable total : int; mutable max : int }
+
+let make_outliers () = { count = 0; total = 0; max = 0 }
+
+(* Record [latency] into [hist], or, if it is too large for the histogram,
+   fold it into [outliers]. [H.record_value] returns [false] for out-of-range
+   values; a non-positive latency is a spurious measurement and is dropped. *)
+let record_latency hist outliers latency =
+  if (not (H.record_value hist latency)) && latency > highest_trackable_value
+  then (
+    outliers.count <- outliers.count + 1;
+    outliers.total <- outliers.total + latency;
+    if latency > outliers.max then outliers.max <- latency)
 
 let lifecycle domain_id ts lifecycle_event _data =
   let ts = float_of_int Int64.(to_int @@ Ts.to_int64 ts) /. 1_000_000_000. in
