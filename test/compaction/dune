@@ -1,0 +1,22 @@
+(executable
+ (name test_compaction)
+ (modules test_compaction)
+ (libraries runtime_events unix))
+
+; test_compaction overflows the ring buffer, so olly must report on stderr that
+; events were lost. The count is not deterministic, hence grepping the stderr
+; rather than a cram test. Compaction is a no-op before OCaml 5.2.
+
+(rule
+ (alias runtest)
+ (package runtime_events_tools)
+ (enabled_if
+  (>= %{ocaml_version} 5.2.0))
+ (deps %{bin:olly} test_compaction.exe)
+ (action
+  (pipe-stderr
+   (setenv
+    OCAMLRUNPARAM
+    e=20,s=8M
+    (run olly gc-stats --freq=0.0 -- ./test_compaction.exe))
+   (run grep -E "^Lost [0-9]+ events, stats not reliable$"))))
