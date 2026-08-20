@@ -1,4 +1,5 @@
 ### Unreleased
+* Report lost words, not events (#126, @ngorogiannis) 
 * Count explicit GC calls (`Gc.compact`, `Gc.major`, `Gc.full_major`) made by any
   domain, not just the main one (#115, @ngorogiannis)
 * Check process status from a dedicated domain (#100, @ngorogiannis)

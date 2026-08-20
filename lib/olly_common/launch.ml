@@ -1,20 +1,20 @@
 external is_process_alive : int -> bool = "olly_is_process_alive"
 
 module Lost_events = struct
-  let lost_events_count = ref 0
+  let lost_words_count = ref 0
 
   let callback _ring_id num =
-    let sum = !lost_events_count + num in
+    let sum = !lost_words_count + num in
     (* detect overflow and stay at [max_int] *)
-    lost_events_count := if sum < 0 then max_int else sum
+    lost_words_count := if sum < 0 then max_int else sum
 
-  let were_events_lost () = !lost_events_count > 0
+  let were_events_lost () = !lost_words_count > 0
 
   let display () =
     if were_events_lost () then begin
-      Printf.eprintf "Lost %d events, stats not reliable%s\n%!"
-        !lost_events_count
-        (if !lost_events_count = max_int then
+      Printf.eprintf "Lost %d ring buffer words, stats not reliable%s\n%!"
+        !lost_words_count
+        (if !lost_words_count = max_int then
            " (possible counter overflow detected)\n%!"
          else "")
     end
