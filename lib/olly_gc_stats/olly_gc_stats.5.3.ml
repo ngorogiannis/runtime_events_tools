@@ -263,8 +263,12 @@ let gc_stats process_poller_sleep poll_sleep json output runtime_events_dir
     | _ -> false
   in
   let runtime_begin ring_id ts phase =
-    if phase == Runtime_events.EV_EXPLICIT_GC_COMPACT && ring_id == 0 then
-      incr compactions;
+    (* The EV_EXPLICIT_GC_* spans wrap a user call to Gc.compact, Gc.major or
+       Gc.full_major, and are emitted only on the domain that made the call, so
+       they are counted whichever domain that is. EV_MINOR and EV_MAJOR_GC_STW
+       below are global stop-the-world points that every live domain emits once
+       per cycle, so counting ring 0 alone yields the cycle count. *)
+    if phase == Runtime_events.EV_EXPLICIT_GC_COMPACT then incr compactions;
 
     if phase == Runtime_events.EV_MINOR && ring_id == 0 then
       incr minor_collections;
@@ -276,9 +280,8 @@ let gc_stats process_poller_sleep poll_sleep json output runtime_events_dir
       incr major_collections;
 
     if
-      (phase == Runtime_events.EV_EXPLICIT_GC_MAJOR
-      || phase == Runtime_events.EV_EXPLICIT_GC_FULL_MAJOR)
-      && ring_id == 0
+      phase == Runtime_events.EV_EXPLICIT_GC_MAJOR
+      || phase == Runtime_events.EV_EXPLICIT_GC_FULL_MAJOR
     then incr forced_major_collections;
 
     if is_gc_phase phase then
