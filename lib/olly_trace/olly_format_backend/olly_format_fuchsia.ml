@@ -30,9 +30,15 @@ let create ~filename =
   let doms =
     let max_doms = 128 in
     Array.init max_doms (fun i ->
-        (* Use a different pid for each domain *)
+        (* Slot [i + 1] of the trace's thread table, bound below. *)
         Trace.Thread_ref.ref (i + 1))
   in
+  (* A [Thread_ref.ref] is an index into the thread table, not a pid. It must be 
+     bound to a (pid, tid) pair by a thread record, so that consumers can tell the 
+     domains apart. *)
+  Array.iteri
+    (fun i _ -> Trace.Thread_record.encode buf ~as_ref:(i + 1) ~pid:0 ~tid:i ())
+    doms;
   { doms; buf; collector; exporter }
 
 let close trace =
