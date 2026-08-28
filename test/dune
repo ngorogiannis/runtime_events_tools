@@ -69,6 +69,15 @@
  (modules run_endlessly)
  (libraries unix))
 
+(executables
+ (names run_exit)
+ (modules run_exit))
+
+(executables
+ (names run_crash)
+ (modules run_crash)
+ (libraries unix))
+
 (test
  (name test_launch)
  (modules test_launch)

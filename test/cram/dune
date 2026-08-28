@@ -1,3 +1,7 @@
 (cram
  (package runtime_events_tools)
- (deps %{bin:olly} %{dep:../test_gc_stats.exe}))
+ (deps
+  %{bin:olly}
+  %{dep:../test_gc_stats.exe}
+  %{dep:../run_exit.exe}
+  %{dep:../run_crash.exe}))

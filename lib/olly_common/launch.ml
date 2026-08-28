@@ -24,6 +24,7 @@ type subprocess = {
   alive : unit -> bool;
   cursor : Runtime_events.cursor;
   close : unit -> unit;
+  exit_status : unit -> Unix.process_status option;
   pid : int;
 }
 
@@ -114,6 +115,15 @@ let create_cursor_when_ready ~dir ~pid ~executable =
   in
   wait ()
 
+let str_of_status status =
+  let open Sys_backport in
+  match status with
+  | Unix.WEXITED code -> Printf.sprintf "exited with code %d" code
+  | Unix.WSIGNALED sys_sig ->
+      Printf.sprintf "killed by signal %s" (signal_to_string sys_sig)
+  | Unix.WSTOPPED sys_sig ->
+      Printf.sprintf "stopped by signal %s" (signal_to_string sys_sig)
+
 let exec_process (config : runtime_events_config) (args : string list) :
     subprocess =
   if not (List.length args > 0) then
@@ -180,18 +190,20 @@ let exec_process (config : runtime_events_config) (args : string list) :
     create_cursor_when_ready ~dir ~pid:child_pid ~executable:executable_filename
   in
   (* used to avoid double reaping, which raises an exception other than ECHILD on windows *)
-  let reaped = Atomic.make false in
+  let reaped = Atomic.make None in
   let alive () =
     match Unix.waitpid [ Unix.WNOHANG ] child_pid with
     | 0, _ -> true
-    | p, _ when p = child_pid ->
-        Atomic.set reaped true;
+    | p, status when p = child_pid ->
+        Atomic.set reaped (Some status);
         false
     | _, _ -> assert false
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> true
   and close () =
-    (if not @@ Atomic.get reaped then
-       try Unix.waitpid [ WNOHANG ] child_pid |> ignore
+    (if Option.is_none @@ Atomic.get reaped then
+       try
+         let _, status = Unix.waitpid [ WNOHANG ] child_pid in
+         Atomic.set reaped (Some status)
        with Unix.Unix_error (Unix.ECHILD, _, _) -> ());
     Runtime_events.free_cursor cursor;
     (* We need to remove the ring buffers ourselves because we told
@@ -200,8 +212,8 @@ let exec_process (config : runtime_events_config) (args : string list) :
        their intent and leave the file in place. *)
     if Sys.getenv_opt "OCAML_RUNTIME_EVENTS_PRESERVE" <> Some "1" then
       Unix.unlink (ring_file_of dir child_pid)
-  in
-  { alive; cursor; close; pid = child_pid }
+  and exit_status () = Atomic.get reaped in
+  { alive; cursor; close; pid = child_pid; exit_status }
 
 let attach_process (dir : string) (pid : int) : subprocess =
   (* Check the target process exists before attempting to attach *)
@@ -227,8 +239,9 @@ let attach_process (dir : string) (pid : int) : subprocess =
     with Failure str -> raise (Fail (str ^ " Directory: " ^ dir))
   in
   let alive () = is_process_alive pid
+  and exit_status () = None
   and close () = Runtime_events.free_cursor cursor in
-  { alive; cursor; close; pid }
+  { alive; cursor; close; pid; exit_status }
 
 let launch_process config (exec_args : exec_config) : subprocess =
   match exec_args with
@@ -326,4 +339,9 @@ let olly config exec_args =
           in
           collect_events ~sample_rss:config.sample_rss
             config.process_poller_sleep config.poll_sleep child callbacks;
-          config.on_success ()))
+          config.on_success ());
+      child.exit_status ()
+      |> Option.iter @@ function
+         | Unix.WEXITED 0 -> ()
+         | status ->
+             raise (Fail (Printf.sprintf "Child %s" @@ str_of_status status)))
