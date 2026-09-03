@@ -1,5 +1,3 @@
-external is_process_alive : int -> bool = "olly_is_process_alive"
-
 module Lost_events = struct
   let lost_events_count = ref 0
 
@@ -20,13 +18,29 @@ module Lost_events = struct
     end
 end
 
+(* Where the process we are tracing came from. The two cases genuinely differ:
+   we own a child we launched and can wait on it, whereas an attached process
+   is somebody else's, so there is no status of it for us to collect. *)
+type origin =
+  | Launched of { reaped : Unix.process_status option Atomic.t }
+  | Attached
+
 type subprocess = {
   alive : unit -> bool;
   cursor : Runtime_events.cursor;
   close : unit -> unit;
-  exit_status : unit -> Unix.process_status option;
+  origin : origin;
   pid : int;
 }
+
+(* The child's own exit status, once it has been collected. [None] means "not
+   yet known" for a launched process and "never knowable" for an attached one,
+   and also covers a child that [close] had to terminate: a status we
+   manufactured by killing it is not the child's own. *)
+let exit_status t =
+  match t.origin with
+  | Launched { reaped } -> Atomic.get reaped
+  | Attached -> None
 
 type runtime_events_config = { log_wsize : int option; dir : string option }
 type exec_config = Attach of string * int | Execute of string list
@@ -46,7 +60,9 @@ exception Fail of string
    we poll instead. *)
 let ring_wait_timeout = 5.0
 let ring_wait_interval = 0.005
-let ring_file_of dir pid = Filename.concat dir (string_of_int pid ^ ".events")
+
+let ring_file_of_pid dir pid =
+  Filename.concat dir (string_of_int pid ^ ".events")
 
 (* The runtime creates the ring file, then resizes it to its final size, then
    fills in the metadata header (see [runtime/runtime_events.c] in the OCaml
@@ -69,15 +85,16 @@ let ring_header_ready ring_file =
               Bytes.get_int64_ne buf 0 <> 0L && Bytes.get_int64_ne buf 8 <> 0L
           | exception End_of_file -> false)
 
-(* Wait for the child process [pid] to initialise its ring buffers and return
+(* Wait for the child process [handle] to initialise its ring buffers and return
    a cursor on them. Raises [Fail] if the child dies first, or if it has not
    initialised them within [ring_wait_timeout]. *)
-let create_cursor_when_ready ~dir ~pid ~executable =
-  let ring_file = ring_file_of dir pid in
+let create_cursor_when_ready ~dir ~pid ~(handle : Platform.handle) ~executable =
+  let ring_file = ring_file_of_pid dir pid in
   let deadline = Unix.gettimeofday () +. ring_wait_timeout in
   let child_exited () =
-    match Unix.waitpid [ Unix.WNOHANG ] pid with
-    | p, _ -> p = pid
+    match Platform.waitpid [ Unix.WNOHANG ] handle with
+    | None -> false
+    | Some _ -> true
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> false
   in
   let rec wait () =
@@ -97,8 +114,8 @@ let create_cursor_when_ready ~dir ~pid ~executable =
     else if Unix.gettimeofday () >= deadline then begin
       (* We cannot monitor the child and are about to bail out, so do not
          leave it running behind us. *)
-      (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
-      (try ignore (Unix.waitpid [] pid) with Unix.Unix_error _ -> ());
+      Platform.terminate handle;
+      (try ignore (Platform.waitpid [] handle) with Unix.Unix_error _ -> ());
       raise
         (Fail
            (Printf.sprintf
@@ -178,49 +195,63 @@ let exec_process (config : runtime_events_config) (args : string list) :
         base_env;
       ]
   in
-  let child_pid =
-    try
-      Unix.create_process_env executable_filename (Array.of_list args) env
-        Unix.stdin Unix.stdout Unix.stderr
-    with Unix.Unix_error (Unix.ENOENT, _, _) ->
-      raise
-        (Fail (Printf.sprintf "executable %s not found" executable_filename))
+  let child_pid, child_handle =
+    let handle =
+      try
+        Platform.create_process_env executable_filename (Array.of_list args) env
+          Unix.stdin Unix.stdout Unix.stderr
+      with Unix.Unix_error (Unix.ENOENT, _, _) ->
+        raise
+          (Fail (Printf.sprintf "executable %s not found" executable_filename))
+    in
+    let pid =
+      match Platform.pid_of_handle handle with
+      | None -> raise (Fail "Invalid handle, GetProcessId failed.")
+      | Some pid -> pid
+    in
+    (pid, handle)
   in
   let cursor =
-    create_cursor_when_ready ~dir ~pid:child_pid ~executable:executable_filename
+    create_cursor_when_ready ~dir ~pid:child_pid ~handle:child_handle
+      ~executable:executable_filename
   in
   (* used to avoid double reaping, which raises an exception other than ECHILD on windows *)
   let reaped = Atomic.make None in
   let alive () =
-    match Unix.waitpid [ Unix.WNOHANG ] child_pid with
-    | 0, _ -> true
-    | p, status when p = child_pid ->
-        Atomic.set reaped (Some status);
+    match Platform.waitpid [ Unix.WNOHANG ] child_handle with
+    | None -> true
+    | Some _ as some_status ->
+        Atomic.set reaped some_status;
         false
-    | _, _ -> assert false
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> true
   and close () =
     (if Option.is_none @@ Atomic.get reaped then
-       try
-         let _, status = Unix.waitpid [ WNOHANG ] child_pid in
-         Atomic.set reaped (Some status)
-       with Unix.Unix_error (Unix.ECHILD, _, _) -> ());
+       match Platform.waitpid [ Unix.WNOHANG ] child_handle with
+       | None -> (
+           (* The child is still running. Do not leave it behind us, and note
+              that the ring file stays mapped, and so cannot be unlinked on
+              Windows, for as long as it lives. *)
+           Platform.terminate child_handle;
+           try ignore (Platform.waitpid [] child_handle)
+           with Unix.Unix_error _ -> ())
+       | Some status -> Atomic.set reaped (Some status)
+       | exception Unix.Unix_error (Unix.ECHILD, _, _) -> ());
     Runtime_events.free_cursor cursor;
     (* We need to remove the ring buffers ourselves because we told
        the child process not to remove them. However, if the user
        explicitly set OCAML_RUNTIME_EVENTS_PRESERVE=1 we honour
        their intent and leave the file in place. *)
     if Sys.getenv_opt "OCAML_RUNTIME_EVENTS_PRESERVE" <> Some "1" then
-      Unix.unlink (ring_file_of dir child_pid)
-  and exit_status () = Atomic.get reaped in
-  { alive; cursor; close; pid = child_pid; exit_status }
+      Unix.unlink (ring_file_of_pid dir child_pid)
+  in
+  { alive; cursor; close; origin = Launched { reaped }; pid = child_pid }
 
 let attach_process (dir : string) (pid : int) : subprocess =
   (* Check the target process exists before attempting to attach *)
-  if not (is_process_alive pid) then
+  if not (Platform.is_process_alive ~pid) then
     raise (Fail (Printf.sprintf "process %d does not exist" pid));
   (* Check the events file exists and is readable *)
-  let ring_file = ring_file_of dir pid in
+  let ring_file = ring_file_of_pid dir pid in
   if not (Sys.file_exists ring_file) then
     raise
       (Fail
@@ -238,10 +269,9 @@ let attach_process (dir : string) (pid : int) : subprocess =
     try Runtime_events.create_cursor (Some (dir, pid))
     with Failure str -> raise (Fail (str ^ " Directory: " ^ dir))
   in
-  let alive () = is_process_alive pid
-  and exit_status () = None
+  let alive () = Platform.is_process_alive ~pid
   and close () = Runtime_events.free_cursor cursor in
-  { alive; cursor; close; pid; exit_status }
+  { alive; cursor; close; origin = Attached; pid }
 
 let launch_process config (exec_args : exec_config) : subprocess =
   match exec_args with
@@ -340,7 +370,7 @@ let olly config exec_args =
           collect_events ~sample_rss:config.sample_rss
             config.process_poller_sleep config.poll_sleep child callbacks;
           config.on_success ());
-      child.exit_status ()
+      exit_status child
       |> Option.iter @@ function
          | Unix.WEXITED 0 -> ()
          | status ->

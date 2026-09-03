@@ -36,3 +36,17 @@ CAMLprim value olly_is_process_alive(value v_pid) {
   CAMLreturn(Val_false);
 #endif
 }
+
+CAMLprim value olly_pid_of_handle(value v_handle) {
+  CAMLparam1(v_handle);
+#ifdef _WIN32
+  /* Unix.create_process stores the Win32 process HANDLE in the value, so go
+     through intnat rather than int: HANDLE is pointer-sized (64-bit on x64)
+     while int is 32-bit. This mirrors win32unix's own stubs. */
+  HANDLE handle = (HANDLE)Long_val(v_handle);
+  DWORD pid = GetProcessId(handle);
+  CAMLreturn(Val_long(pid));
+#else
+  CAMLreturn(v_handle);
+#endif
+}
