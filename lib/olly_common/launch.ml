@@ -26,6 +26,9 @@ type subprocess = {
   close : unit -> unit;
   exit_status : unit -> Unix.process_status option;
   pid : int;
+  (* Path to the process's ring buffer file. The poller needs it to tell the
+     ring's resident pages apart from the program's own memory. *)
+  ring_file : string;
 }
 
 type runtime_events_config = { log_wsize : int option; dir : string option }
@@ -213,7 +216,14 @@ let exec_process (config : runtime_events_config) (args : string list) :
     if Sys.getenv_opt "OCAML_RUNTIME_EVENTS_PRESERVE" <> Some "1" then
       Unix.unlink (ring_file_of dir child_pid)
   and exit_status () = Atomic.get reaped in
-  { alive; cursor; close; pid = child_pid; exit_status }
+  {
+    alive;
+    cursor;
+    close;
+    pid = child_pid;
+    exit_status;
+    ring_file = ring_file_of dir child_pid;
+  }
 
 let attach_process (dir : string) (pid : int) : subprocess =
   (* Check the target process exists before attempting to attach *)
@@ -241,7 +251,7 @@ let attach_process (dir : string) (pid : int) : subprocess =
   let alive () = is_process_alive pid
   and exit_status () = None
   and close () = Runtime_events.free_cursor cursor in
-  { alive; cursor; close; pid; exit_status }
+  { alive; cursor; close; pid; exit_status; ring_file }
 
 let launch_process config (exec_args : exec_config) : subprocess =
   match exec_args with
@@ -259,7 +269,7 @@ let collect_events ~sample_rss process_poller_sleep poll_sleep child callbacks =
     ~finally:(fun () -> Sys.set_signal Sys.sigint old_handler)
     (fun () ->
       Process_poller.start ~alive_check:child.alive ~pid:child.pid
-        ~interval:process_poller_sleep ~sample_rss;
+        ~ring_file:child.ring_file ~interval:process_poller_sleep ~sample_rss;
       Fun.protect ~finally:Process_poller.stop (fun () ->
           (* Read from the child process *)
           while Process_poller.is_alive () && not (Atomic.get interrupted) do
